@@ -1,5 +1,8 @@
 # sankey_app.py
-# Streamlit app to visualize a fixed Excel lineage file as a Sankey diagram.
+# Streamlit app to visualize a fixed Excel lineage file as:
+# 1) A Sankey diagram
+# 2) A neural-net-style force-directed graph
+#
 # The Excel file must be located at: data/Choice Data to Visualize.xlsx
 
 from pathlib import Path
@@ -8,10 +11,11 @@ import re
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import networkx as nx
 
 # ---------- App Config ----------
 st.set_page_config(page_title="Choice Data Sankey", layout="wide")
-st.title("Choice Data Sankey")
+st.title("Choice Data Sankey And Graph View")
 
 # Location of the fixed Excel file, bundled with the app repo
 DATA_PATH = Path(__file__).parent / "data" / "Choice Data to Visualize.xlsx"
@@ -72,10 +76,10 @@ def group_source(name: str) -> str:
     t = name.split("_")[0].upper()
     return t if len(t) >= 3 else name
 
-def build_sankey(df: pd.DataFrame, aggregate: bool, min_count: int) -> tuple[go.Figure, int, int]:
+def build_sankey(df: pd.DataFrame, aggregate: bool, min_count: int):
     """
     Build a Sankey figure from a tidy DataFrame with columns: Source, Target.
-    - aggregate: if True, group sources by system (e.g., JDE, STG, RETOOL)
+    - aggregate: if True, group sources by system (for example JDE, STG, RETOOL)
     - min_count: drop links with frequency below this threshold
     Returns: (figure, node_count, link_count)
     """
@@ -121,6 +125,93 @@ def build_sankey(df: pd.DataFrame, aggregate: bool, min_count: int) -> tuple[go.
     fig.update_layout(margin=dict(l=10, r=10, t=10, b=10))
     return fig, len(nodes), len(link_counts)
 
+def build_graph(df: pd.DataFrame, aggregate: bool, min_count: int):
+    """
+    Build a neural-net-style force-directed graph using NetworkX and Plotly.
+    Nodes are arranged with a spring layout and sized by weighted degree.
+    Returns: (figure, node_count, edge_count)
+    """
+    data = df.copy()
+    if aggregate:
+        data["Source"] = data["Source"].apply(group_source)
+
+    link_counts = (
+        data.groupby(["Source", "Target"], as_index=False)
+            .size()
+            .rename(columns={"size": "Value"})
+    )
+    link_counts = link_counts[link_counts["Value"] >= min_count]
+    if link_counts.empty:
+        return go.Figure(), 0, 0
+
+    # Build graph
+    G = nx.Graph()
+    for _, row in link_counts.iterrows():
+        src = row["Source"]
+        tgt = row["Target"]
+        w = row["Value"]
+        if G.has_edge(src, tgt):
+            G[src][tgt]["weight"] += w
+        else:
+            G.add_edge(src, tgt, weight=w)
+
+    # Spring layout positions
+    pos = nx.spring_layout(G, k=0.7, iterations=60, seed=42)
+
+    # Edges
+    edge_x = []
+    edge_y = []
+    for u, v in G.edges():
+        x0, y0 = pos[u]
+        x1, y1 = pos[v]
+        edge_x.extend([x0, x1, None])
+        edge_y.extend([y0, y1, None])
+
+    edge_trace = go.Scatter(
+        x=edge_x,
+        y=edge_y,
+        line=dict(width=0.5, color="rgba(150,150,150,0.7)"),
+        hoverinfo="none",
+        mode="lines",
+    )
+
+    # Nodes
+    node_x = []
+    node_y = []
+    node_text = []
+    node_size = []
+    for node in G.nodes():
+        x, y = pos[node]
+        node_x.append(x)
+        node_y.append(y)
+        node_text.append(node)
+        degree = G.degree(node, weight="weight")
+        node_size.append(10 + degree * 2)
+
+    node_trace = go.Scatter(
+        x=node_x,
+        y=node_y,
+        mode="markers+text",
+        hoverinfo="text",
+        text=node_text,
+        textposition="top center",
+        marker=dict(
+            showscale=False,
+            size=node_size,
+            line=dict(width=1, color="black"),
+            color="rgba(31,119,180,0.9)",
+        ),
+    )
+
+    fig = go.Figure(data=[edge_trace, node_trace])
+    fig.update_layout(
+        showlegend=False,
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        margin=dict(l=10, r=10, t=10, b=10),
+    )
+    return fig, G.number_of_nodes(), G.number_of_edges()
+
 # ---------- Load fixed file ----------
 if not DATA_PATH.exists():
     st.error("The fixed Excel file is missing. Expected at: data/Choice Data to Visualize.xlsx")
@@ -138,6 +229,7 @@ with st.sidebar:
     stage_sel = st.multiselect("Stage", stages, default=stages or [])
     batch_sel = st.multiselect("Scheduling Group / Airflow Batch", batches, default=batches or [])
     text_query = st.text_input("Search (matches Source or Target)", "")
+    view_type = st.radio("View type", ["Sankey", "Neural graph"], index=0)
     aggregate = st.radio("Aggregation level", ["Raw nodes", "Group sources by system"], index=1)
     min_count = st.slider("Hide links with count less than", 1, 10, 1, 1)
 
@@ -153,11 +245,18 @@ if text_query.strip():
     filtered = filtered[mask]
 
 # ---------- Build & Render ----------
-fig, node_count, link_count = build_sankey(
-    filtered,
-    aggregate=(aggregate == "Group sources by system"),
-    min_count=min_count,
-)
+if view_type == "Sankey":
+    fig, node_count, link_count = build_sankey(
+        filtered,
+        aggregate=(aggregate == "Group sources by system"),
+        min_count=min_count,
+    )
+else:
+    fig, node_count, link_count = build_graph(
+        filtered,
+        aggregate=(aggregate == "Group sources by system"),
+        min_count=min_count,
+    )
 
 st.caption(f"Nodes: {node_count} | Links: {link_count}")
 st.plotly_chart(fig, use_container_width=True)
@@ -176,5 +275,4 @@ st.download_button(
     mime="text/csv",
 )
 
-# ---------- Footer Note ----------
 st.caption("Data source: data/Choice Data to Visualize.xlsx")
